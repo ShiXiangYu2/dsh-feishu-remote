@@ -1,0 +1,27 @@
+{
+  "name": "dsh-feishu-remote",
+  "version": "0.1.0",
+  "description": "Control your DeepSeek Harness agent from Feishu/Lark: send tasks via DM, receive results back, approve tool calls from mobile cards. Powered by lark-cli.",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "feishu",
+    "lark",
+    "remote",
+    "mobile"
+  ],
+  "license": "MIT"
+}
