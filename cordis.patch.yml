@@ -1,0 +1,3 @@
+- insert:
+    - id: feishu-remote
+      name: dsh-feishu-remote
