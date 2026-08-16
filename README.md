@@ -1,22 +1,28 @@
 # 📱 DSH Feishu Remote
 
-> Control your [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) agent from **Feishu / Lark** on your phone. Send a task by DM — get the result back in chat.
+> Control your [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) agent from **Feishu / Lark** on your phone. Send a task by DM — get the result back in chat. **Fully working closed loop.**
 
 [![dsh-plugin](https://img.shields.io/badge/dsh-plugin-4d7fff)](https://github.com/topics/dsh-plugin) [![DeepSeek Harness](https://img.shields.io/badge/deepseek--harness-plugin-4d7fff)](https://github.com/deepseek-ai/deepseek-harness) [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ## ✨ What it does
 
-- 📨 **Feishu → Agent**: DM your Feishu bot a task, a headless DSH agent runs it, and the result comes back to the chat.
+- 📨 **Feishu → Agent → Feishu**: DM your bot a task (e.g. `2+3等于几？`), a DSH agent runs it with your configured LLM, and the **answer comes back to the chat**.
 - 📤 **Agent → Feishu**: the model gets a `feishu_send` tool to push results/notifications to any user or chat.
-- 🤖 **Long connection**: uses `lark-cli`'s WebSocket event bus — **no public webhook server needed**, works on localhost/LAN.
-- 🔒 **Secure**: reuses `lark-cli`'s OS-keychain credential storage and permission system.
+- 🤖 **Long connection**: uses `lark-cli`'s WebSocket event bus — **no public webhook server needed**, works on localhost/LAN/private servers.
+- 🔒 **Secure**: reuses `lark-cli`'s OS-keychain credential storage and permission system; event listener runs unsandboxed by design (it must hold the WebSocket).
 
 ## 🚀 Install
 
 ### 0. Prerequisites
 
-- A Feishu/Lark **self-built app** with the **Bot** ability enabled, event subscription `im.message.receive_v1` (long-connection mode), and permissions `im:message`, `im:message:send_as_bot`, `im:message.p2p_msg:readonly`, `im:chat:read`, `im:resource` — all configured in the [Feishu developer console](https://open.feishu.cn/app).
-- `lark-cli` installed & authenticated once:
+1. A Feishu/Lark **self-built app** with:
+   - **Bot** ability enabled
+   - Event subscription `im.message.receive_v1` (**long-connection** mode)
+   - Permissions: `im:message`, `im:message:send_as_bot`, `im:message.p2p_msg:readonly`, `im:chat:read`, `im:resource`
+   - A published version
+   - (Setup in the [Feishu developer console](https://open.feishu.cn/app) — the CLI can enable the bot ability via API, but events/permissions need the console.)
+
+2. `lark-cli` installed & authenticated once:
 
 ```sh
 npm i -g @larksuite/cli
@@ -30,17 +36,49 @@ lark-cli auth login --recommend # scan QR to authorize
 dsh plugin --profile demo add github:ShiXiangYu2/dsh-feishu-remote
 ```
 
-### 2. Configure
+The bundle contains two pieces:
+- `index.js` — the Cordis plugin: registers the `feishu_send` model tool and attempts an in-process event listener.
+- `feishu-resident.mjs` — the **recommended resident launcher**: boots the web profile and runs the long-connection event loop in a detached process (see below).
 
-```sh
-export LARK_HOME="$HOME"        # where lark-cli config lives
-export LARK_SEND_AS=bot         # bot (default) or user
-dsh --profile demo
+### 2. Configure the model
+
+The DSH profile must have a working LLM route (e.g. DeepSeek via SiliconFlow):
+
+```yaml
+# profile cordis.patch.yml
+- id: llm-deepseek
+  config:
+    apiKeyEnv: SILICONFLOW_API_KEY
+    baseURL: https://api.siliconflow.cn/v1
+    thinking: disabled
+    reasoningEffort: off
+    models:
+      - id: deepseek-ai/DeepSeek-V3.2
+        name: DeepSeek-V3.2 (via SiliconFlow)
+        contextWindow: 65536
+        maxTokens: 8192
+
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: deepseek-ai/DeepSeek-V3.2
 ```
 
-### 3. Use it
+### 3. Run the resident (recommended)
 
-DM your Feishu bot: `帮我总结一下 ~/projects 的 README` — the agent runs and replies in Feishu.
+The closed loop must live in a **long-lived process**. Use the included resident launcher:
+
+```sh
+# Adjust the absolute paths in feishu-resident.mjs (LARK_HOME, CLI) to your setup.
+DSH_HOME=~/.dsh SILICONFLOW_API_KEY=sk-... \
+  node --import tsx/esm feishu-resident.mjs
+```
+
+It boots the `web` profile, spawns `lark-cli event consume` as a detached process (holding stdin open via a `tail -f /dev/null` pipe so the listener never exits on EOF), and for each inbound DM: **ack → create agent → run task → extract final text → reply**.
+
+### 4. Use it
+
+DM your Feishu bot anything, e.g. `帮我总结一下 ~/projects 的 README` — the agent runs and the result comes back to the chat.
 
 ## 🛠 Tools
 
@@ -51,20 +89,24 @@ DM your Feishu bot: `帮我总结一下 ~/projects 的 README` — the agent run
 ## 🔌 How it works
 
 ```
-Feishu DM ──► lark-cli event consume (WebSocket long-connection)
-                  │
+Feishu DM ──► lark-cli event consume (WebSocket long-connection, detached process)
+                  │  NDJSON event on stdout
                   ▼
-        DSH agent session (agents.create)
-                  │  agent.send(task) → whenIdle()
+        feishu-resident.mjs (long-lived process)
+                  │  agents.create + followup(task) + whenIdle()
                   ▼
-        result text ──► lark-cli im +messages-send ──► Feishu chat
+        final assistant text (ev.data.message.content)
+                  │  lark-cli im +messages-send
+                  ▼
+        Feishu chat reply
 ```
 
 ## ⚠️ Notes
 
-- The full agent task wiring uses DSH's headless agent API (`agents.create` + `agent.send`); requires the `dsh-agent-loop` provider to be loaded (it is in the default profile).
-- Long tasks: the plugin currently awaits `whenIdle()`; very long runs may exceed Feishu's message size — replies are truncated to the final text block.
-- See the [Feishu developer console](https://open.feishu.cn/app) for app setup details (abilities, permissions, event subscription, version release).
+- **Why a resident process?** DSH's shell service binds background processes to the calling plugin fiber; a listener started inside a plugin's `apply()` is killed when the fiber settles. The resident launcher owns the listener in its own process, so it survives.
+- **Text extraction**: the final answer is read from the session log's `assistant/message` events (`ev.data.message.content`, mirroring the official headless `summarize()`).
+- Long tasks: replies are truncated to the final text block; very long runs may exceed Feishu message limits.
+- lark-cli event output streams as NDJSON on **stdout** (stderr carries `[event]` log lines) — both are parsed.
 
 ## 📄 License
 
