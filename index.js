@@ -1,5 +1,6 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { existsSync } from 'node:fs'
+import { dirname, basename } from 'node:path'
 
 export const name = 'feishu-remote-plugin'
 export const inject = ['tools', 'shell', 'agents', 'timer']
@@ -74,6 +75,33 @@ async function sendTo(ctx, target, text) {
   const flag = String(target).startsWith('oc_') ? '--chat-id' : '--user-id'
   const r = await runLark(ctx, ['im', '+messages-send', flag, target, '--text', String(text), '--as', SEND_AS])
   return r.ok
+}
+
+/** Send a local image to a user (ou_) or chat (oc_). */
+async function sendImageTo(ctx, target, imagePath) {
+  const shell = ctx.get('shell')
+  if (shell === undefined) return { ok: false, error: 'shell unavailable' }
+  const flag = String(target).startsWith('oc_') ? '--chat-id' : '--user-id'
+  const dir = dirname(imagePath)
+  const base = basename(imagePath)
+  // lark-cli requires a relative --image path within the current directory;
+  // cd into the image's directory and pass the bare filename.
+  const command = `cd ${q(dir)} && HOME=${q(ENV_HOME)} ${q(CLI)} im +messages-send ${flag} ${q(String(target))} --image ${q(base)} --as ${SEND_AS}`
+  const spec = shell.resolve({
+    command,
+    timeoutMs: 90000,
+    sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: ENV_HOME },
+  })
+  const result = await shell.run(spec)
+  if (result.exitCode !== 0) {
+    return { ok: false, error: `send image failed (exit ${result.exitCode}): ${result.stderr.text.slice(0, 200)}` }
+  }
+  try {
+    const data = JSON.parse(result.stdout.text)
+    return { ok: data && data.ok !== false }
+  } catch {
+    return { ok: false, error: 'cannot parse send-image response' }
+  }
 }
 
 /** Create a headless agent and run one task; returns the final message text. */
@@ -154,6 +182,56 @@ function registerSendTool(ctx) {
     async execute(args) {
       const ok = await sendTo(ctx, args.target, args.text)
       return ok ? '✅ 已发送到飞书' : '❌ 发送失败'
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'feishu_send_image',
+    description: 'Send a local image file to a Feishu/Lark user (ou_) or chat (oc_). Use after generating or producing an image.',
+    parameters: {
+      target: { type: 'string', required: true, description: 'open_id (ou_xxx) or chat_id (oc_xxx).' },
+      image: { type: 'string', required: true, description: 'Absolute path to the local image file to send.' },
+      as: { type: 'string', enum: ['user', 'bot'], description: 'Identity. Default: bot.' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    async execute(args) {
+      if (!args.image || !existsSync(args.image)) {
+        return `❌ 图片不存在: ${args.image}`
+      }
+      const r = await sendImageTo(ctx, args.target, args.image)
+      return r.ok ? '✅ 图片已发送到飞书' : `❌ 发送失败: ${r.error || ''}`
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'feishu_download',
+    description: 'Download a URL (e.g. a generated image URL) to a local file so it can be sent to Feishu via feishu_send_image. Returns the local file path.',
+    parameters: {
+      url: { type: 'string', required: true, description: 'The URL to download (http/https).' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    async execute(args) {
+      const shell = ctx.get('shell')
+      if (shell === undefined) return '❌ shell unavailable'
+      const dir = '/root/dsh /feishu-images'
+      const fname = `dl-${Date.now().toString(36)}.png`
+      const outPath = `${dir}/${fname}`
+      const spec = shell.resolve({
+        command: `mkdir -p ${q(dir)} && curl -sL --max-time 60 ${q(String(args.url))} -o ${q(outPath)}`,
+        timeoutMs: 70000,
+        sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: ENV_HOME },
+      })
+      const result = await shell.run(spec)
+      if (result.exitCode !== 0 || !existsSync(outPath)) {
+        return `❌ 下载失败: ${result.stderr.text.slice(0, 150)}`
+      }
+      return `✅ 已下载到 ${outPath}`
     },
   }))
 }
