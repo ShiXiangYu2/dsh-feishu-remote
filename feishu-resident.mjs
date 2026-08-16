@@ -127,6 +127,27 @@ async function runAgentTask(ctx, task, senderId) {
 
 const VISION_MODEL = process.env.FEISHU_VISION_MODEL || 'Qwen/Qwen3-VL-8B-Instruct'
 const IMG_DIR = '/root/dsh /feishu-images'
+const IMG_RETENTION_DAYS = Number(process.env.FEISHU_IMG_RETENTION_DAYS || 7)
+
+/** Delete image files older than IMG_RETENTION_DAYS in IMG_DIR. */
+async function cleanupOldImages() {
+  try {
+    const { readdirSync, statSync, unlinkSync } = await import('node:fs')
+    const cutoff = Date.now() - IMG_RETENTION_DAYS * 24 * 60 * 60 * 1000
+    let removed = 0
+    for (const name of readdirSync(IMG_DIR)) {
+      try {
+        const p = `${IMG_DIR}/${name}`
+        const st = statSync(p)
+        if (st.isFile() && st.mtimeMs < cutoff) {
+          unlinkSync(p)
+          removed++
+        }
+      } catch { /* ignore per-file */ }
+    }
+    if (removed > 0) log(`cleanup: removed ${removed} image(s) older than ${IMG_RETENTION_DAYS} days`)
+  } catch (e) { log('cleanup err: ' + String(e).slice(0, 150)) }
+}
 
 /** Download a Feishu image resource to a local file; returns the local path or null. */
 async function downloadImage(messageId, imageKey) {
@@ -212,6 +233,10 @@ async function main() {
   })
   console.log(`[resident] web booted (PID ${process.pid}); starting lark event listener…`)
   log('web booted')
+
+  // Retention cleanup: run at startup and then daily.
+  cleanupOldImages()
+  setInterval(() => cleanupOldImages(), 24 * 60 * 60 * 1000)
 
   const child = spawn('bash', ['-c',
     `HOME=${q(HOME)} ${q(CLI)} event consume im.message.receive_v1 --as bot --timeout 0s --max-events 0 < <(tail -f /dev/null)`],
