@@ -7,6 +7,7 @@
 ## ✨ What it does
 
 - 📨 **Feishu → Agent → Feishu**: DM your bot a task (e.g. `2+3等于几？`), a DSH agent runs it with your configured LLM, and the **answer comes back to the chat**.
+- 🖼️ **Image understanding**: send a screenshot or photo — it's downloaded and analyzed by a vision model (Qwen3-VL), then the agent replies with what it sees.
 - 📤 **Agent → Feishu**: the model gets a `feishu_send` tool to push results/notifications to any user or chat.
 - 🤖 **Long connection**: uses `lark-cli`'s WebSocket event bus — **no public webhook server needed**, works on localhost/LAN/private servers.
 - 🔒 **Secure**: reuses `lark-cli`'s OS-keychain credential storage and permission system; event listener runs unsandboxed by design (it must hold the WebSocket).
@@ -93,6 +94,8 @@ Feishu DM ──► lark-cli event consume (WebSocket long-connection, detached 
                   │  NDJSON event on stdout
                   ▼
         feishu-resident.mjs (long-lived process)
+                  │  image? → download (messages-resources-download)
+                  │          → vision describe (Qwen3-VL via SiliconFlow)
                   │  agents.create + followup(task) + whenIdle()
                   ▼
         final assistant text (ev.data.message.content)
@@ -100,6 +103,20 @@ Feishu DM ──► lark-cli event consume (WebSocket long-connection, detached 
                   ▼
         Feishu chat reply
 ```
+
+### Image handling
+
+- The event content for an image arrives as `[Image: img_v3_xxx]`.
+- The resident detects that pattern, downloads the resource via
+  `lark-cli im +messages-resources-download` (using the event's real `message_id`
+  + the `image_key`), then asks a SiliconFlow vision model
+  (`Qwen/Qwen3-VL-8B-Instruct`, overridable with `FEISHU_VISION_MODEL`) to
+  describe the picture.
+- The description is prepended to the user's message and fed to the DSH agent,
+  so the agent can reason about the image and reply in Feishu.
+- Downloaded images land in the `IMG_DIR` (`/root/dsh /feishu-images` by
+  default; the download command requires a **relative** `--output` path, so the
+  resident `cd`s into that directory first).
 
 ## ⚠️ Notes
 
