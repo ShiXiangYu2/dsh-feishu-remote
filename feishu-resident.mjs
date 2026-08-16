@@ -125,6 +125,85 @@ async function runAgentTask(ctx, task, senderId) {
   }
 }
 
+const VISION_MODEL = process.env.FEISHU_VISION_MODEL || 'Qwen/Qwen3-VL-8B-Instruct'
+const IMG_DIR = '/root/dsh /feishu-images'
+
+/** Download a Feishu image resource to a local file; returns the local path or null. */
+async function downloadImage(messageId, imageKey) {
+  try {
+    const { mkdirSync } = await import('node:fs')
+    mkdirSync(IMG_DIR, { recursive: true })
+    const ext = 'png'
+    const fname = `${imageKey.replace(/[^a-zA-Z0-9]/g, '')}.${ext}`
+    const outPath = `${IMG_DIR}/${fname}`
+    // lark-cli forbids absolute --output paths; run from IMG_DIR with a
+    // relative output name, then the file lands in IMG_DIR.
+    const cmd = `cd ${q(IMG_DIR)} && HOME=${q(HOME)} ${q(CLI)} im +messages-resources-download --message-id ${q(messageId)} --file-key ${q(imageKey)} --type image --output ${q(fname)} --as ${SEND_AS}`
+    const r = await runShell(cmd)
+    if (!r) { log('downloadImage: command failed'); return null }
+    const { existsSync } = await import('node:fs')
+    return existsSync(outPath) ? outPath : null
+  } catch (e) { log('downloadImage err: ' + String(e).slice(0, 150)); return null }
+}
+
+/** Analyze an image with a SiliconFlow vision model; returns a text description. */
+async function analyzeImage(imagePath) {
+  try {
+    const { readFileSync } = await import('node:fs')
+    const b64 = readFileSync(imagePath).toString('base64')
+    const body = {
+      model: VISION_MODEL,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: `data:image/png;base64,${b64}` } },
+          { type: 'text', text: '请详细描述这张图片的内容（中文），包括主体、场景、文字信息等。' },
+        ],
+      }],
+      max_tokens: 500,
+    }
+    const res = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.SILICONFLOW_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    })
+    const data = await res.json()
+    if (data.choices && data.choices[0]) return data.choices[0].message.content
+    return null
+  } catch (e) { log('analyzeImage err: ' + String(e).slice(0, 200)); return null }
+}
+
+/** Run a shell command and return whether it succeeded (capturing stdout). */
+function runShell(command) {
+  return new Promise((resolve) => {
+    const c = spawn('bash', ['-c', command], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    c.stdout.on('data', (d) => { out += d })
+    c.on('close', (code) => resolve(code === 0))
+    c.on('error', () => resolve(false))
+  })
+}
+
+/** Expand a Feishu message: if it contains [Image: key], download + describe. */
+async function expandMessage(evt) {
+  const content = evt.content || ''
+  const messageId = evt.id || evt.message_id || ''
+  const m = content.match(/\[Image:\s*([^\]]+)\]/)
+  if (!m) return { text: content }
+  const imageKey = m[1].trim()
+  log(`detected image key: ${imageKey}`)
+  const path = await downloadImage(messageId, imageKey)
+  if (!path) return { text: content, imageError: '图片下载失败' }
+  log('image downloaded: ' + path)
+  const desc = await analyzeImage(path)
+  if (!desc) return { text: content, imageError: '图片分析失败' }
+  log('image described: ' + String(desc).slice(0, 80))
+  return { text: `${content}\n\n[图片内容分析]\n${desc}` }
+}
+
 async function main() {
   const { ctx, shutdown } = await runProfile({
     profile: 'web',
@@ -154,9 +233,13 @@ async function main() {
     if (!content || !chatId) return
     log(`<< EVENT message from ${senderId}: ${String(content).slice(0, 60)}`)
     ;(async () => {
-      await sendTo(chatId, `🤖 收到，正在处理：${String(content).slice(0, 60)}…`)
+      const isImage = /\[Image:/.test(content)
+      await sendTo(chatId, isImage ? '🖼️ 收到图片，正在分析…' : `🤖 收到，正在处理：${String(content).slice(0, 60)}…`)
       log('ack sent')
-      const r = await runAgentTask(ctx, String(content), String(senderId))
+      // Expand images into text (download + vision description) before the task.
+      const expanded = await expandMessage(evt)
+      const task = expanded.imageError ? `用户发了一张图片但处理失败（${expanded.imageError}）。请告知用户图片无法处理。` : expanded.text
+      const r = await runAgentTask(ctx, task, String(senderId))
       const reply = r.ok ? r.text : `❌ ${r.error}`
       log(`>> reply: ${String(reply).slice(0, 80)}`)
       await sendTo(chatId, reply)
