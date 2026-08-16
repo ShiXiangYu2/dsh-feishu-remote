@@ -8,7 +8,9 @@
 
 - 📨 **Feishu → Agent → Feishu**: DM your bot a task (e.g. `2+3等于几？`), a DSH agent runs it with your configured LLM, and the **answer comes back to the chat**.
 - 🖼️ **Image understanding**: send a screenshot or photo — it's downloaded and analyzed by a vision model (Qwen3-VL), then the agent replies with what it sees.
-- 📤 **Agent → Feishu**: the model gets a `feishu_send` tool to push results/notifications to any user or chat.
+- 🎨 **Image generation round-trip**: the agent can generate an image (`generate_image`), download it locally (`feishu_download`), and send the actual image back to your Feishu chat (`feishu_send_image`) — not just a link.
+- 📤 **Agent → Feishu**: the model gets `feishu_send` / `feishu_send_image` / `feishu_download` tools to push results, files, and generated images to any user or chat.
+- 🧹 **Retention cleanup**: downloaded images are kept for 7 days (configurable via `FEISHU_IMG_RETENTION_DAYS`), then auto-deleted — no unbounded disk growth.
 - 🤖 **Long connection**: uses `lark-cli`'s WebSocket event bus — **no public webhook server needed**, works on localhost/LAN/private servers.
 - 🔒 **Secure**: reuses `lark-cli`'s OS-keychain credential storage and permission system; event listener runs unsandboxed by design (it must hold the WebSocket).
 
@@ -86,6 +88,8 @@ DM your Feishu bot anything, e.g. `帮我总结一下 ~/projects 的 README` —
 | Tool | Description |
 |---|---|
 | `feishu_send` | Model-facing: send a message to a Feishu user (`ou_`) or chat (`oc_`). |
+| `feishu_send_image` | Model-facing: send a local image file to a Feishu user or chat. |
+| `feishu_download` | Model-facing: download a URL to a local file (so generated images can be sent via `feishu_send_image`). |
 
 ## 🔌 How it works
 
