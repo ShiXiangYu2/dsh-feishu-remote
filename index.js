@@ -1,4 +1,5 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { existsSync } from 'node:fs'
 
 export const name = 'feishu-remote-plugin'
 export const inject = ['tools', 'shell', 'agents', 'timer']
@@ -19,21 +20,40 @@ export const inject = ['tools', 'shell', 'agents', 'timer']
  *
  * Env:
  *   LARK_HOME  - HOME to use for lark-cli config (default: process HOME)
- *   LARK_CLI   - lark-cli binary path (default: "lark-cli" on PATH)
+ *   LARK_CLI   - lark-cli binary path (default: auto-detect)
  *   LARK_SEND_AS - "bot" (default) or "user"
  */
 
-const ENV_HOME = process.env.LARK_HOME
-const CLI = process.env.LARK_CLI || 'lark-cli'
+// Locate lark-cli: env override first, then a known deployment path, then PATH.
+function resolveCli() {
+  if (process.env.LARK_CLI) return process.env.LARK_CLI
+  const known = '/root/dsh /larkenv/cli/node_modules/.bin/lark-cli'
+  try {
+    if (existsSync(known)) return known
+  } catch { /* ignore */ }
+  return 'lark-cli'
+}
+const ENV_HOME = process.env.LARK_HOME || '/root/dsh /larkenv/home'
+const CLI = resolveCli()
 const SEND_AS = process.env.LARK_SEND_AS || 'bot'
+
+/** Quote a path for use inside a `bash -c` command string. */
+function q(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`
+}
 
 /** Run one lark-cli command with JSON args; returns parsed result. */
 async function runLark(ctx, argv) {
   const shell = ctx.get('shell')
   if (shell === undefined) return { ok: false, error: 'shell service unavailable' }
   const parts = argv.map((a) => (/^[A-Za-z0-9_./:@=+-]+$/.test(a) ? a : JSON.stringify(a)))
-  const command = `HOME=${JSON.stringify(ENV_HOME || process.env.HOME)} ${CLI} ${parts.join(' ')}`
-  const spec = shell.resolve({ command, timeoutMs: 90000 })
+  const command = `HOME=${q(ENV_HOME)} ${q(CLI)} ${parts.join(' ')}`
+  const spec = shell.resolve({
+    command,
+    timeoutMs: 90000,
+    // lark-cli needs keychain config + network; run unsandboxed.
+    sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: ENV_HOME },
+  })
   const result = await shell.run(spec)
   if (result.exitCode !== 0) {
     return { ok: false, error: `lark-cli exit ${result.exitCode}: ${result.stderr.text.slice(0, 300)}` }
@@ -127,6 +147,10 @@ function registerSendTool(ctx) {
       text: { type: 'string', required: true, description: 'Message text.' },
       as: { type: 'string', enum: ['user', 'bot'], description: 'Identity. Default: bot.' },
     },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
     async execute(args) {
       const ok = await sendTo(ctx, args.target, args.text)
       return ok ? '✅ 已发送到飞书' : '❌ 发送失败'
@@ -140,19 +164,32 @@ function registerSendTool(ctx) {
  */
 function startEventListener(ctx) {
   const shell = ctx.get('shell')
-  if (shell === undefined) return
-  const spec = shell.resolve({
-    command: `HOME=${JSON.stringify(ENV_HOME || process.env.HOME)} ${CLI} event consume im.message.receive_v1 --as bot --timeout 0s --quiet`,
-    timeoutMs: 0,
-  })
-  const proc = shell.start(spec)
-  ctx.effect(() => { try { proc.kill?.() } catch { /* ignore */ } })
+  if (shell === undefined) { console.error('[feishu-remote] shell unavailable'); return }
+  try {
+    const spec = shell.resolve({
+      // Keep stderr (event JSON + ready markers flow there); no --quiet.
+      // Keep stdin open via a tail pipe: lark-cli exits on stdin EOF, so an
+      // idle consumer must hold stdin. --max-events 0 = unlimited.
+      command: `HOME=${q(ENV_HOME)} ${q(CLI)} event consume im.message.receive_v1 --as bot --timeout 0s --max-events 0 < <(tail -f /dev/null)`,
+      // Note: `start()` ignores timeoutMs (background processes have no executor timeout).
+      // Long-lived WebSocket listener needs full access (keychain config, sockets):
+      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: ENV_HOME },
+    })
+    const proc = shell.start(spec)
+    ctx.effect(() => { try { proc.kill?.() } catch { /* ignore */ } })
+    console.log('[feishu-remote] event listener started, polling lark-cli output…')
+    // Surface early process death so a spawn failure is visible.
+    proc.done.then(() => {
+      console.log(`[feishu-remote] listener process exited: code=${proc.exitCode} signal=${proc.signal} sandbox=${JSON.stringify(proc.sandbox || null)}`)
+    }).catch((e) => {
+      console.error('[feishu-remote] listener process error:', String(e))
+    })
 
   // Poll the process output (readOutput is consuming; poll on a timer).
   const poll = () => {
     try {
       const read = proc.readOutput()
-      const text = (read && read.text) || ''
+      const text = (read && read.delta) || ''
       for (const raw of text.split('\n')) {
         const line = raw.trim()
         if (!line || line.startsWith('[')) continue
@@ -174,7 +211,13 @@ function startEventListener(ctx) {
     } catch { /* process gone */ }
   }
   // lark-cli prints each event as one NDJSON line; poll every 500ms.
-  ctx.interval?.(poll, 500)
+  // Bundle plugins run in a real Node process: use setInterval directly,
+  // owned by this plugin's effect so stop/update clears it.
+  const timer = setInterval(poll, 500)
+  ctx.effect(() => clearInterval(timer))
+  } catch (e) {
+    console.error('[feishu-remote] event listener failed:', String((e && e.message) || e))
+  }
 }
 
 export function apply(ctx) {
